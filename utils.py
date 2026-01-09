@@ -200,123 +200,98 @@ def parse_listings(file):
 
 
 
-def analyze_with_gemini(df, api_key, model_name='gemini-3-flash-preview'):
-    """
-    Analyzes reviews using Google Gemini API.
-    Batches reviews to reduce API calls.
-    Returns df with 'PositivePoints' and 'NegativePoints'.
-    """
-    if df.empty:
-        return df
-        
-    # Configure Client
+
+def _analyze_reviews_worker(batch, api_key, model_name):
+    """Worker for threaded review analysis."""
+    import json
+    from google import genai
+    from google.genai import types
+    
     client = genai.Client(api_key=api_key)
+    prompt_items = []
     
-    # Model name is passed as argument.
-    # We trust the app.py to provide a valid one.
-
-    # Prepare data
-    df['full_text'] = df['comment'].fillna('').astype(str)
-    pf_col = 'privateFeedback' if 'privateFeedback' in df.columns else ('private_feedback' if 'private_feedback' in df.columns else None)
-    if pf_col:
-        df['full_text'] = df['full_text'] + " " + df[pf_col].fillna('').astype(str)
+    # Needs to return items with 'review_id' to map back for DB
+    # The batch has 'review_id' column
     
-    # Create result columns
-    df['PositivePoints'] = [[] for _ in range(len(df))]
-    df['NegativePoints'] = [[] for _ in range(len(df))]
+    for _, row in batch.iterrows():
+        rid = row['review_id']
+        c_text = str(row.get('comment', '')) if pd.notnull(row.get('comment')) else ""
+        pf_key = 'privateFeedback' if 'privateFeedback' in batch.columns else 'private_feedback'
+        p_text = str(row.get(pf_key, '')) if pd.notnull(row.get(pf_key)) else ""
+        
+        prompt_items.append({
+            "id": rid, 
+            "comment": c_text,
+            "private_feedback": p_text
+        })
+        
+    prompt = f"""
+    You are an expert hospitality analyst. Analyze the following reviews.
     
-    # Batch processing
-    # Reduced to 5 to avoid timeouts with complex models/large payloads
-    batch_size = 5
+    Tasks for EACH item:
+    1. **Translation**: If 'comment' or 'private_feedback' is NOT in English, translate it to English. If it is already in English, return it exactly as is.
+    2. **Analysis**: Extract 'PositivePoints' (strengths) and 'NegativePoints' (issues) from BOTH the 'comment' and 'private_feedback'. Use **Standardized Labels** (e.g., 'Excellent Location', 'Noise Complaint').
     
-    # We iterate by index chunks
-    num_reviews = len(df)
+    Input Data:
+    {json.dumps(prompt_items)}
     
-    # Create result columns
-    df['PositivePoints'] = [[] for _ in range(num_reviews)]
-    df['NegativePoints'] = [[] for _ in range(num_reviews)]
-    df['CommentEnglish'] = [None for _ in range(num_reviews)]
-    df['PrivateFeedbackEnglish'] = [None for _ in range(num_reviews)]
-
-    for i in range(0, num_reviews, batch_size):
-        # Get slice of dataframe
-        batch_df = df.iloc[i : i + batch_size]
-        indices = batch_df.index.tolist()
-        
-        # Construct Prompt
-        prompt_items = []
-        for local_idx, (df_idx, row) in enumerate(batch_df.iterrows()):
-            # Use original 'comment' and 'privateFeedback' (or whatever column is present)
-            # We must be careful about column names.
-            # In analyze_with_gemini, df usually comes from unfiltered or parsed data.
-            # db.get_unprocessed_reviews returned columns: review_id, full_text, comment, private_feedback
-            # parse_excel_data returns: comment, privateFeedback
-            
-            # Helper to get text safely
-            c_text = str(row.get('comment', '')) if pd.notnull(row.get('comment')) else ""
-            
-            # private feedback might be 'privateFeedback' (raw) or 'private_feedback' (db)
-            pf_key = 'privateFeedback' if 'privateFeedback' in df.columns else 'private_feedback'
-            p_text = str(row.get(pf_key, '')) if pd.notnull(row.get(pf_key)) else ""
-            
-            prompt_items.append({
-                "id": local_idx, 
-                "comment": c_text,
-                "private_feedback": p_text
-            })
-            
-        prompt = f"""
-        You are an expert hospitality analyst. Analyze the following reviews.
-        
-        Tasks for EACH item:
-        1. **Translation**: If 'comment' or 'private_feedback' is NOT in English, translate it to English. If it is already in English, return it exactly as is.
-        2. **Analysis**: Extract 'PositivePoints' (strengths) and 'NegativePoints' (issues) from BOTH the 'comment' and 'private_feedback'. Use **Standardized Labels** (e.g., 'Excellent Location', 'Noise Complaint').
-        
-        Input Data:
-        {json.dumps(prompt_items)}
-        
-        Return ONLY a valid JSON List of Objects. Format:
-        [
-            {{
-                "id": 0, 
-                "PositivePoints": ["Label 1", ...], 
-                "NegativePoints": ["Label 1", ...],
-                "CommentEnglish": "Translated comment...",
-                "PrivateFeedbackEnglish": "Translated private feedback..."
-            }},
-            ...
-        ]
-        """
-        
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
+    Return ONLY a valid JSON List of Objects. Format:
+    [
+        {{
+            "id": "REVIEW_ID", 
+            "PositivePoints": ["Label 1", ...], 
+            "NegativePoints": ["Label 1", ...],
+            "CommentEnglish": "Translated comment...",
+            "PrivateFeedbackEnglish": "Translated private feedback..."
+        }},
+        ...
+    ]
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
             )
-            
-            response_text = response.text
-            response_data = json.loads(response_text)
-            
-            # Map back to DataFrame
-            for item in response_data:
-                local_id = item.get('id')
-                if local_id is not None and 0 <= local_id < len(indices):
-                    df_idx = indices[local_id]
-                    df.at[df_idx, 'PositivePoints'] = item.get('PositivePoints', [])
-                    df.at[df_idx, 'NegativePoints'] = item.get('NegativePoints', [])
-                    df.at[df_idx, 'CommentEnglish'] = item.get('CommentEnglish')
-                    df.at[df_idx, 'PrivateFeedbackEnglish'] = item.get('PrivateFeedbackEnglish')
-                    
-        except Exception as e:
-            print(f"Batch analysis failed: {e}")
-            time.sleep(1) 
-            
-    return df
+        )
+        data = json.loads(response.text)
+        return data
+    except Exception as e:
+        print(f"Batch review analysis failed: {e}")
+        return []
 
-    return df, list(likely_host_ids)
+def analyze_reviews_batch_generator(df, api_key, model_name='gemini-3-flash-preview', batch_size=20):
+    """
+    Analyzes reviews using Parallel Execution.
+    Yields batches of analysis results (list of dicts).
+    """
+    import concurrent.futures
+    import time
+    
+    if df.empty:
+        return
+
+    # Create batches
+    # Ensure columns exist
+    batches = [df.iloc[i:i+batch_size] for i in range(0, len(df), batch_size)]
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_batch = {
+            executor.submit(_analyze_reviews_worker, b, api_key, model_name): b 
+            for b in batches
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_batch):
+            try:
+                data = future.result()
+                if data:
+                    yield data
+            except Exception as e:
+                print(f"Parallel review batch failed: {e}")
+
+
 
 def clean_reviews_data(df_reviews, listings_list):
     """
@@ -1239,3 +1214,103 @@ def generate_category_strategy_report(df, category_name, api_key, model_name='ge
         return resp.text
     except Exception as e:
         return f"Error generating strategy: {e}"
+
+
+def _extract_review_issues_worker(batch, api_key, model_name):
+    """Worker for threaded Review Intelligence extraction."""
+    import json
+    from google import genai
+    
+    client = genai.Client(api_key=api_key)
+    prompt_items = []
+    
+    for _, row in batch.iterrows():
+        # Context: Negative Points list + Full Comment
+        neg_points = row.get('NegativePoints', [])
+        if isinstance(neg_points, str):
+            try: neg_points = json.loads(neg_points)
+            except: neg_points = [str(neg_points)]
+        
+        context_text = f"Issues: {neg_points} | Full Review: {row.get('comment')}"
+        
+        prompt_items.append({
+            'id': row['review_id'],
+            'content': context_text
+        })
+        
+    if not prompt_items:
+        return []
+        
+    prompt = f"""
+    You are an Airbnb Quality Analyst.
+    
+    Task: Analyze these reviews and extract specific, atomic issues into a structured list.
+    
+    Categories to use:
+    - 'Cleanliness': Dirt, dust, hair, smells, laundry.
+    - 'Maintenance': Broken items, wifi, appliances, leaks.
+    - 'Accuracy': Photos don't match, missing amenities.
+    - 'Communication': Slow host, rude, bad info.
+    - 'Check-in': ID issues, codes, location.
+    - 'Value': Price, noise (if external).
+    
+    Sub-Issue Rules:
+    - Snake_case (e.g., 'hair_on_bed', 'wifi_slow', 'ac_broken').
+    - Be specific but standardized.
+    
+    Input:
+    {json.dumps(prompt_items)}
+    
+    Return JSON List:
+    [
+        {{
+            "review_id": "...", 
+            "category": "Cleanliness",
+            "sub_issue": "dirty_floor",
+            "snippet": "floor was sticky"
+        }},
+        ...
+    ]
+    """
+    
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={'response_mime_type': 'application/json'}
+        )
+        
+        batch_results = json.loads(response.text)
+        return batch_results
+                
+    except Exception as e:
+        print(f"Extraction Error: {e}")
+        return []
+
+def extract_review_issues_batch(df, api_key, model_name='gemini-3-flash-preview', batch_size=20):
+    """
+    Analyzes reviews with negative feedback using Parallel Execution.
+    Yields batches of results.
+    """
+    import concurrent.futures
+    
+    if df.empty:
+        return
+
+    # Create batches
+    batches = [df.iloc[i:i+batch_size] for i in range(0, len(df), batch_size)]
+    
+    # Run in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_batch = {
+            executor.submit(_extract_review_issues_worker, b, api_key, model_name): b 
+            for b in batches
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_batch):
+            try:
+                data = future.result()
+                if data:
+                    yield data
+            except Exception as e:
+                print(f"Parallel review extraction failed: {e}")

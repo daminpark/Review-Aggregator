@@ -1,4 +1,4 @@
-from utils import parse_excel_data, analyze_with_gemini, parse_listings, parse_messages, analyze_messages_with_gemini, clean_reviews_data, parse_csv_reviews, parse_csv_messages, translate_messages_batch, translate_reviews_batch, classify_actionability_batch, aggregate_threads, classify_topics_hierarchical_batch, generate_category_strategy_report
+from utils import parse_excel_data, parse_listings, parse_messages, analyze_messages_with_gemini, clean_reviews_data, parse_csv_reviews, parse_csv_messages, translate_messages_batch, translate_reviews_batch, classify_actionability_batch, aggregate_threads, classify_topics_hierarchical_batch, generate_category_strategy_report, extract_review_issues_batch, analyze_reviews_batch_generator
 import streamlit as st
 import pandas as pd
 import db
@@ -281,114 +281,123 @@ with tab_reviews:
     if df.empty:
         st.info("Database is empty. Please upload an Airbnb Excel file to begin.")
     else:
-        # --- Analysis Logic (Incremental & Re-analysis) ---
-        unprocessed_df = db.get_unprocessed_reviews()
+        # --- UNIFIED REVIEW WORKFLOW ---
+        # 1. Identify Reviews needing Analysis
+        all_reviews = db.get_all_reviews_with_listings()
         
-        col_a, col_b = st.columns([1, 1])
+        # Normailize Columns for Compatibility (Snake -> Camel)
+        # DB uses snake_case, but UI/AI logic uses CamelCase
+        if 'positive_points' in all_reviews.columns: 
+            all_reviews['PositivePoints'] = all_reviews['positive_points']
+            # Parse JSON if string (DB returns string)
+            # Actually, the parsing happens usually in utils or display. 
+            # Let's simple mapping for now.
+        if 'negative_points' in all_reviews.columns: 
+            all_reviews['NegativePoints'] = all_reviews['negative_points']
+        if 'comment_english' in all_reviews.columns:
+            all_reviews['CommentEnglish'] = all_reviews['comment_english']
+        if 'private_feedback_english' in all_reviews.columns:
+            all_reviews['PrivateFeedbackEnglish'] = all_reviews['private_feedback_english']
+        
+        def is_analyzed(row):
+            # Check if PositivePoints or NegativePoints is populated (and not just empty list from init)
+            # Actually, our new init clears them to NULL.
+            # But let's check for non-null
+            p = row.get('PositivePoints')
+            n = row.get('NegativePoints')
+            # If both are None or empty string, it's unanalyzed.
+            # (If it's an empty list [], it means it WAS analyzed but found nothing, so we skip it)
+            if p is None and n is None: return False
+            return True
+
+        # Apply check (Pandas might treat None/NaN variously depending on how it was loaded)
+        # Safest is to check if it has valuable data.
+        # But we want to process NEW ones.
+        # DB returns None for NULL columns.
+        
+        # Filter: Reviews where PositivePoints is None (unprocessed)
+        # Note: 'PositivePoints' column might not exist if DF is fresh.
+        if 'PositivePoints' not in all_reviews.columns:
+            all_reviews['PositivePoints'] = None
+            
+        pending_mask = all_reviews['PositivePoints'].isna()
+        pending_reviews = all_reviews[pending_mask]
+        pending_count = len(pending_reviews)
+        
+        analyzed_count = len(all_reviews) - pending_count
+
+        col_a, col_b = st.columns([2, 1])
         
         with col_a:
-            if not unprocessed_df.empty:
-                count = len(unprocessed_df)
-                st.info(f"💡 {count} new reviews.")
+            st.subheader("Review Analysis")
+            if pending_count > 0:
+                st.info(f"⚡ **{pending_count} Pending Reviews** detected.")
                 
                 if api_key:
-                    if st.button(f"✨ Analyze New ({model_choice})"):
-                        with st.spinner(f"Analyzing..."):
-                            try:
-                                analyzed_df = analyze_with_gemini(unprocessed_df, api_key, model_name=model_choice)
-                                
-                                # Update DB
-                                success_count = 0
-                                for _, row in analyzed_df.iterrows():
-                                    if 'PositivePoints' in row and 'NegativePoints' in row:
-                                        pos = row['PositivePoints'] if isinstance(row['PositivePoints'], list) else []
-                                        neg = row['NegativePoints'] if isinstance(row['NegativePoints'], list) else []
-                                        c_en = row.get('CommentEnglish')
-                                        p_en = row.get('PrivateFeedbackEnglish')
-                                        
-                                        db.update_review_analysis(row['review_id'], pos, neg, c_en, p_en)
-                                        success_count += 1
-                                
-                                st.success(f"Updated {success_count} reviews.")
-                                time.sleep(1)
-                                st.rerun()
-                                
-                            except Exception as e:
-                                st.error(f"Analysis failed: {e}")
+                     if st.button(f"🚀 Analyze {pending_count} Pending (Rapid)"):
+                         with st.spinner("Analyzing reviews in parallel..."):
+                             import time
+                             progress_bar = st.progress(0)
+                             status_text = st.empty()
+                             
+                             processed_cnt = 0
+                             
+                             # Generator
+                             analyzer = analyze_reviews_batch_generator(pending_reviews, api_key, model_choice)
+                             
+                             for batch_data in analyzer:
+                                 if batch_data:
+                                     # Update DB
+                                     for item in batch_data:
+                                         # Map item back to DB update
+                                         rid = item.get('id')
+                                         pos = item.get('PositivePoints', [])
+                                         neg = item.get('NegativePoints', [])
+                                         c_en = item.get('CommentEnglish')
+                                         p_en = item.get('PrivateFeedbackEnglish')
+                                         
+                                         db.update_review_analysis(rid, pos, neg, c_en, p_en)
+                                     
+                                     processed_cnt += len(batch_data)
+                                     prog = min(processed_cnt / (pending_count + 1), 1.0)
+                                     progress_bar.progress(prog)
+                                     status_text.text(f"Analyzed {processed_cnt} reviews...")
+                             
+                             progress_bar.progress(1.0)
+                             status_text.text("Analysis Complete!")
+                             time.sleep(1)
+                             st.rerun()
             else:
-                 st.success("All reviews analyzed.")
+                st.success("✅ All reviews analyzed.")
 
-            # --- Review Translation Button ---
+            # Translation (Keep existing logic)
             untranslated_revs = db.get_untranslated_reviews()
             if not untranslated_revs.empty and api_key:
                 st.divider()
                 if st.button(f"🌐 Translate {len(untranslated_revs)} Reviews (English)"):
                     st.info("Translating reviews to English... (Resumable)")
-                    
+                    # ... [Keep existing translation logic if desired, or simplify? user didn't ask to change translation]
+                    # Let's keep it but condensed.
                     with st.spinner("Translating..."):
                         tr_progress = st.progress(0)
                         tr_status = st.empty()
-                        
                         total_tr = len(untranslated_revs)
                         processed_tr = 0
-                        
-                        # Use Gemini Flash for speed
                         translator = translate_reviews_batch(untranslated_revs, api_key, model_name="gemini-3-flash-preview")
-                        
                         for batch_data in translator:
                             if batch_data:
-                                # Batch Save
                                 db.update_review_translations_bulk(batch_data)
-                                
                                 processed_tr += len(batch_data)
-                                prog = min(processed_tr / total_tr, 1.0)
-                                tr_progress.progress(prog)
-                                tr_status.text(f"Translated {processed_tr}/{total_tr} reviews...")
-                                
-                        tr_progress.empty()
-                        tr_status.empty()
-                        st.success("Translation Complete!")
-                        time.sleep(1)
+                                tr_progress.progress(min(processed_tr/total_tr, 1.0))
+                                tr_status.text(f"Translated {processed_tr} reviews...")
                         st.rerun()
 
         with col_b:
-            with st.expander("🔄 Re-Analysis"):
-                st.write("run analysis on ALL reviews again using the selected model.")
-                st.warning("Consumes API quota.")
-                only_issues = st.checkbox("Only reviews with issues?", value=True)
-                
-                if st.button("Re-categorize All"):
-                     if not api_key:
-                         st.error("No API Key")
-                     else:
-                         with st.spinner("Re-analyzing reviews..."):
-                             all_df = db.get_all_reviews_with_listings()
-                             if only_issues:
-                                 def has_issues(x):
-                                     try: return isinstance(x, list) and len(x) > 0
-                                     except: return False
-                                 if 'NegativePoints' in all_df.columns:
-                                     mask = all_df['NegativePoints'].apply(has_issues)
-                                     target_df = all_df[mask]
-                                 else: target_df = all_df
-                             else:
-                                 target_df = all_df
-                                 
-                             if target_df.empty:
-                                 st.warning("No reviews matched criteria.")
-                             else:
-                                 analyzed_df = analyze_with_gemini(target_df, api_key, model_name=model_choice)
-                                 count = 0
-                                 for _, row in analyzed_df.iterrows():
-                                    pos = row.get('PositivePoints', [])
-                                    neg = row.get('NegativePoints', [])
-                                    c_en = row.get('CommentEnglish')
-                                    p_en = row.get('PrivateFeedbackEnglish')
-                                    db.update_review_analysis(row['review_id'], pos, neg, c_en, p_en)
-                                    count += 1
-                                 st.success(f"Done: {count} reviews.")
-                                 time.sleep(1)
-                                 st.rerun()
+            st.metric("Total Analyzed", analyzed_count)
+            if analyzed_count > 0:
+                if st.button(f"🗑️ Clear Analysis ({analyzed_count})"):
+                    db.clear_review_analysis()
+                    st.rerun()
 
         # --- Pre-processing for Display ---
         # FILTERING
@@ -425,68 +434,135 @@ with tab_reviews:
         if 'rating_value' in df.columns: m5.metric("Avg Value", f"{df['rating_value'].mean():.2f}")
 
         # --- AI Insights ---
-        st.subheader("Analysis Insights")
+        # --- Review Intelligence (v2.0) ---
+        st.divider()
+        st.subheader("🧠 Review Intelligence")
+        st.caption("Deep-dive analysis into specific complaints and operational issues.")
         
-        if api_key:
-            report_label = "📝 Generate Portfolio Report" if not selected_listings else f"📝 Generate Report for {len(selected_listings)} Listing(s)"
-            if st.button(report_label):
-                with st.spinner("Generating detailed report..."):
-                    report_data = {}
-                    for _, row in df.iterrows():
-                        lname = str(row.get('listing_name', 'Unknown'))
-                        issues = row.get('NegativePoints', [])
-                        if isinstance(issues, list) and issues:
-                            if lname not in report_data: report_data[lname] = []
-                            report_data[lname].extend(issues)
+        # 1. Fetch Existing Issues
+        rev_issues_df = db.get_review_issues()
+        existing_ids = set(rev_issues_df['review_id'].unique()) if not rev_issues_df.empty else set()
+        
+        # 2. Identify Candidates for Extraction
+        all_revs = db.get_all_reviews_with_listings()
+        
+        def has_neg(x):
+            try: 
+               blob = x if isinstance(x, list) else json.loads(x)
+               return len(blob) > 0
+            except: return False
+            
+        cand_revs = all_revs[all_revs['NegativePoints'].apply(has_neg)]
+        
+        # Filter out already extracted
+        target_revs = cand_revs[~cand_revs['review_id'].isin(existing_ids)]
+        
+        pending_count = len(target_revs)
+        extracted_count = len(existing_ids)
+        total_candidates = len(cand_revs)
+        
+        # Metric Display
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Target Reviews (Issues)", total_candidates)
+        m2.metric("Deeply Extracted", extracted_count)
+        m3.metric("Pending", pending_count)
+        
+        # 3. Controls
+        col_ri_1, col_ri_2 = st.columns([1, 1])
+        with col_ri_1:
+             btn_label = "✅ All Issues Extracted" if pending_count == 0 else f"🚀 Extract Deep Issues ({pending_count} Pending)"
+             
+             if st.button(btn_label, disabled=(pending_count==0), type="primary" if pending_count > 0 else "secondary"):
+                 st.info(f"Deep analyzing {pending_count} reviews for specific operational issues... (Resumable)")
+                 
+                 with st.spinner("Extracting atomic issues..."):
+                     import time
+                     progress_bar = st.progress(0)
+                     status_text = st.empty()
+                     
+                     processed_count = 0
+                     
+                     # Generator yields batches
+                     extractor = extract_review_issues_batch(target_revs, api_key, model_choice)
+                     
+                     for batch_data in extractor:
+                         if batch_data:
+                             db.insert_review_issues_bulk(batch_data)
+                             processed_count += len(batch_data) # roughly items, not source reviews
+                             
+                             # Simple progress (heuristic: 1 batch = 1 step closer)
+                             # Since we don't know total batches exactly in generator, we estimate
+                             current_prog = 0.5 # Infinite spinner effect or simplified
+                             # Better: just use 0.0-1.0 if we knew total. 
+                             # Let's use processed items count vs expected items? No.
+                             status_text.text(f"Extracting... {processed_count} issues found so far.")
+                     
+                     progress_bar.progress(1.0)
+                     status_text.text("Extraction Complete!")
+                     time.sleep(1)
+                     st.rerun()
+                             
+        with col_ri_2:
+            if not rev_issues_df.empty:
+                if st.button(f"🗑️ Clear Intelligence Data ({len(rev_issues_df)} Issues)"):
+                    if db.clear_review_issues(): # Check if successful? Function returns None usually.
+                        pass
+                    st.success("Cleared deep analysis data.")
+                    time.sleep(1)
+                    st.rerun()
+            else:
+                st.button("🗑️ Clear Intelligence Data", disabled=True)
+
+        # 3. Dashboard
+        if not rev_issues_df.empty:
+            # Rename snippet -> text for compatibility with strategy report
+            rev_issues_df['text'] = rev_issues_df['snippet']
+            
+            # Category Tabs
+            cats = ['Cleanliness', 'Maintenance', 'Accuracy', 'Communication', 'Check-in', 'Value']
+            tabs = st.tabs([f"🧹 {c}" if c=='Cleanliness' else f"🛠️ {c}" if c=='Maintenance' else c for c in cats])
+            
+            for i, cat in enumerate(cats):
+                with tabs[i]:
+                    cat_data = rev_issues_df[rev_issues_df['category'] == cat]
                     
-                    if not report_data:
-                        st.info("No negative issues found.")
+                    if cat_data.empty:
+                        st.info(f"No issues found for {cat}.")
                     else:
-                        from google import genai
-                        client = genai.Client(api_key=api_key)
-                        prompt = f"""
-                        You are a Senior Property Manager. 
-                        Data: {json.dumps(report_data)}
-                        TASK: Per-Listing Breakdown (Room/System), Overall Portfolio Summary, Action Plan.
-                        Output valid Markdown.
-                        """
-                        try:
-                            resp = client.models.generate_content(model=model_choice, contents=prompt)
-                            st.markdown("---")
-                            st.markdown("## 📋 Generated Report")
-                            st.markdown(resp.text)
-                        except Exception as e:
-                            st.error(f"Report generation failed: {e}")
+                        st.metric("Total Issues", len(cat_data))
+                        
+                        # Strategy Button
+                        if api_key:
+                            btn_key = f"btn_strat_{cat}"
+                            rep_key = f"rep_strat_{cat}"
+                            
+                            if st.button(f"Generate {cat} Strategy", key=btn_key):
+                                with st.spinner("Consulting AI..."):
+                                    rep = generate_category_strategy_report(cat_data, cat, api_key, model_choice)
+                                    st.session_state[rep_key] = rep
+                            
+                            if rep_key in st.session_state:
+                                st.markdown("---")
+                                st.markdown(st.session_state[rep_key])
+                        
+                        st.divider()
+                        
+                        # Top Sub-Issues
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write("**Top Recurring Problems**")
+                            top = cat_data['sub_issue'].value_counts().reset_index()
+                            top.columns = ['Issue', 'Count']
+                            st.dataframe(top, use_container_width=True, hide_index=True)
+                        
+                        with c2:
+                            st.write("**Recent Snippets**")
+                            st.dataframe(cat_data[['sub_issue', 'snippet']].head(20), use_container_width=True, hide_index=True)
+        else:
+             st.info("No deep issues extracted yet. Click the button above to analyze.")
 
-        col_issues, col_strengths = st.columns(2)
-        selected_topic = None
         
-        def get_exploded_series(dataframe, col):
-            if col not in dataframe.columns: return pd.Series(dtype='object')
-            s = dataframe.explode(col)[col]
-            return s.dropna()
-
-        with col_issues:
-            st.write("### 🚩 Key Issues")
-            neg_series = get_exploded_series(df, 'NegativePoints')
-            if not neg_series.empty:
-                top_issues = neg_series.value_counts().reset_index()
-                top_issues.columns = ["Topic", "Count"]
-                event_issues = st.dataframe(top_issues, on_select="rerun", selection_mode="single-row", hide_index=True, width="stretch", key="issues_table")
-                if len(event_issues.selection.rows) > 0:
-                     selected_topic = top_issues.iloc[event_issues.selection.rows[0]]["Topic"]
-            else: st.info("No issues detected yet.")
-
-        with col_strengths:
-            st.write("### ✅ Top Strengths")
-            pos_series = get_exploded_series(df, 'PositivePoints')
-            if not pos_series.empty:
-                top_strengths = pos_series.value_counts().reset_index()
-                top_strengths.columns = ["Topic", "Count"]
-                event_strengths = st.dataframe(top_strengths, on_select="rerun", selection_mode="single-row", hide_index=True, width="stretch", key="strengths_table")
-                if len(event_strengths.selection.rows) > 0:
-                     selected_topic = top_strengths.iloc[event_strengths.selection.rows[0]]["Topic"]
-            else: st.info("No strengths detected yet.")
+        selected_topic = None
 
         # --- Review Explorer ---
         st.divider()

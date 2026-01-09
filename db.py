@@ -46,6 +46,16 @@ def init_db():
         )
     ''')
     
+    # MIGRATION: Check for review analysis columns (positive_points)
+    try:
+        c.execute("SELECT positive_points FROM reviews LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Migrating DB: Adding analysis columns to reviews table...")
+        c.execute("ALTER TABLE reviews ADD COLUMN positive_points TEXT")
+        c.execute("ALTER TABLE reviews ADD COLUMN negative_points TEXT")
+        c.execute("ALTER TABLE reviews ADD COLUMN comment_english TEXT")
+        c.execute("ALTER TABLE reviews ADD COLUMN private_feedback_english TEXT")
+    
     # Config Table (for API Key etc)
     c.execute('''
         CREATE TABLE IF NOT EXISTS config (
@@ -121,6 +131,18 @@ def init_db():
             analysis_json TEXT,
             automation_score INTEGER,
             estimated_savings INTEGER
+        )
+    ''')
+    
+    # Phase 4: Review Issues Table (Granular)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS review_issues (
+            issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id TEXT,
+            category TEXT,
+            sub_issue TEXT,
+            snippet TEXT,
+            FOREIGN KEY(review_id) REFERENCES reviews(review_id)
         )
     ''')
 
@@ -716,5 +738,54 @@ def clear_solution_proposals():
     conn = get_connection()
     c = conn.cursor()
     c.execute("DELETE FROM solution_proposals")
+    conn.commit()
+    conn.close()
+
+def insert_review_issues_bulk(issues):
+    """
+    Inserts extracted review issues.
+    issues: List of {'review_id', 'category', 'sub_issue', 'snippet'}
+    """
+    if not issues:
+        return
+        
+    conn = get_connection()
+    c = conn.cursor()
+    
+    params = [(
+        x['review_id'], 
+        x['category'], 
+        x['sub_issue'], 
+        x['snippet']
+    ) for x in issues]
+    
+    c.executemany('''
+        INSERT INTO review_issues (review_id, category, sub_issue, snippet)
+        VALUES (?, ?, ?, ?)
+    ''', params)
+    
+    conn.commit()
+    conn.close()
+
+def get_review_issues():
+    """Fetches all review issues."""
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM review_issues", conn)
+    conn.close()
+    return df
+
+def clear_review_issues():
+    """Clears all review issues."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM review_issues")
+    conn.commit()
+    conn.close()
+
+def clear_review_analysis():
+    """Resets analysis columns in reviews table."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE reviews SET positive_points=NULL, negative_points=NULL, comment_english=NULL, private_feedback_english=NULL")
     conn.commit()
     conn.close()
