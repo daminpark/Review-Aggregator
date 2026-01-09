@@ -5,7 +5,7 @@ A powerful Streamlit-based application designed to process, aggregate, and analy
 ## 🚀 Key Features
 
 *   **Excel Data Injection**: parses complex/messy Excel dumps from Airbnb data requests (specifically the "Reviews" and "Listings" sheets).
-*   **AI-Powered Analysis**: Uses Google Gemini (supporting `gemini-1.5-flash`, `gemini-1.5-pro`, `gemini-3-flash-preview` etc.) to:
+*   **AI-Powered Analysis**: Uses Google Gemini (supporting `gemini-3-flash-preview` and `gemini-3-pro-preview`) to:
     *   **Translate** non-English reviews automatically.
     *   **Extract** key "Positive Points" and "Negative Points" from both public comments and private feedback.
 *   **Persistent Database**: Stores all processed reviews and listings in a local SQLite database (`reviews.db`) to build a historical portfolio view.

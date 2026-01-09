@@ -1,0 +1,25 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Excel Files (Data)
+*.xlsx
+*.xls
+*.csv
+
+# Databases
+*.db
+*.sqlite3
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# System Files
+.DS_Store
+.DS_Store?
+
+# One-off scripts
+fix_schema.py
+fix_schema_nodep.py
